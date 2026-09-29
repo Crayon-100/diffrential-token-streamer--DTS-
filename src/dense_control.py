@@ -46,14 +46,14 @@ class FloorBResult:
 def compute_floor_b_copy_mask(
     sequence: str,
     root_dir: str = "data/DAVIS",
-    bound_th: float = 2.0,
+    bound_th: Optional[float] = None,
 ) -> FloorBResult:
     """Evaluates Floor B: copies Frame 0 ground-truth mask to all subsequent frames.
 
     Args:
         sequence: DAVIS sequence name.
         root_dir: Path to DAVIS dataset.
-        bound_th: Boundary distance threshold (default: 2.0 px).
+        bound_th: Boundary distance threshold. If None, uses official 0.008 * diagonal.
 
     Returns:
         FloorBResult with mean J, mean F, and mean J&F.
@@ -63,14 +63,20 @@ def compute_floor_b_copy_mask(
     if n_frames < 2:
         raise ValueError(f"Sequence {sequence} requires at least 2 frames.")
 
-    gt_mask_0 = loader[0].gt_mask_pixel.numpy().astype(np.uint8)
+    item0 = loader[0]
+    gt_mask_0 = item0.gt_mask_native.numpy().astype(np.uint8) if item0.gt_mask_native is not None else item0.gt_mask_pixel.numpy().astype(np.uint8)
+    eff_bound_th = bound_th
+    if eff_bound_th is None:
+        diag = np.sqrt(float(gt_mask_0.shape[0] ** 2 + gt_mask_0.shape[1] ** 2))
+        eff_bound_th = 0.008 * diag
 
     j_list: List[float] = []
     f_list: List[float] = []
 
     for t in range(1, n_frames):
-        gt_mask_t = loader[t].gt_mask_pixel.numpy().astype(np.uint8)
-        metrics = compute_davis_metrics(pred_mask=gt_mask_0, gt_mask=gt_mask_t, bound_th=bound_th)
+        item_t = loader[t]
+        gt_mask_t = item_t.gt_mask_native.numpy().astype(np.uint8) if item_t.gt_mask_native is not None else item_t.gt_mask_pixel.numpy().astype(np.uint8)
+        metrics = compute_davis_metrics(pred_mask=gt_mask_0, gt_mask=gt_mask_t, bound_th=eff_bound_th)
         j_list.append(metrics["jaccard"])
         f_list.append(metrics["f_measure"])
 
@@ -188,3 +194,73 @@ def evaluate_dense_rvq_control(
     )
 
     return prop_result, total_wire_bytes, wire_kbps
+
+
+def evaluate_dense_rvq_frame_skip(
+    sequence: str,
+    raw_tokens_stream: List[torch.Tensor],
+    packer: Packer,
+    num_quantizers: int = 1,
+    skip_interval: int = 2,
+    root_dir: str = "data/DAVIS",
+    fps: float = 25.0,
+    device: Optional[torch.device] = None,
+) -> Tuple[SequenceLabelPropagationResult, int, float]:
+    """Evaluates Dense RVQ with frame-skipping (1/2 rate: every 2nd frame transmitted).
+
+    On skipped frames, 0 bytes are transmitted and the server holds the previous token cache.
+
+    Args:
+        sequence: DAVIS sequence name.
+        raw_tokens_stream: Extracted raw ViT tokens [1, 256, 384] for all frames.
+        packer: Shared Packer instance.
+        num_quantizers: Codebook stages (default: 1 for 1 byte/token).
+        skip_interval: Transmit every N-th frame (default: 2 -> half rate).
+        root_dir: Path to DAVIS dataset.
+        fps: Video framerate.
+        device: Torch computation device.
+
+    Returns:
+        Tuple of (SequenceLabelPropagationResult, total_wire_bytes, wire_kbps).
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    rebuilder = Rebuilder(packer=packer, device=device)
+    n_frames = len(raw_tokens_stream)
+    mask_all = torch.ones(256, dtype=torch.bool, device=device)
+
+    tokens_stream: List[torch.Tensor] = []
+    total_wire_bytes = 0
+
+    for idx, curr_tokens in enumerate(raw_tokens_stream):
+        tokens_dev = curr_tokens.to(device)
+        is_keyframe = (idx == 0)
+        should_transmit = (idx % skip_interval == 0)
+
+        if should_transmit:
+            p_out = packer(
+                z_active=tokens_dev[0],
+                mask=mask_all,
+                frame_id=idx,
+                patch_grid=(16, 16),
+                is_keyframe=is_keyframe,
+                num_quantizers=num_quantizers,
+            )
+            total_wire_bytes += p_out.packet.wire_bytes
+            _ = rebuilder(p_out.packet)
+        # On skipped frames: 0 wire bytes transmitted, cache is retained!
+
+        tokens_stream.append(rebuilder.token_cache.clone().detach().cpu())
+
+    wire_kbps = compute_bitrate_kbps(total_wire_bytes, num_frames=n_frames, fps=fps)
+
+    prop_result = evaluate_sequence_label_propagation(
+        sequence=sequence,
+        tokens_stream=tokens_stream,
+        root_dir=root_dir,
+        device=device,
+    )
+
+    return prop_result, total_wire_bytes, wire_kbps
+
