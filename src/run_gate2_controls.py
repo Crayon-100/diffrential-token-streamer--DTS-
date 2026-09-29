@@ -268,7 +268,7 @@ def evaluate_sequence_7_configs(
     fps: float = 25.0,
     device: Optional[torch.device] = None,
 ) -> SequenceControlsEvaluation:
-    """Executes all 7 configurations on a single DAVIS sequence."""
+    """Executes all controls and baseline configurations on a single DAVIS sequence."""
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -277,127 +277,31 @@ def evaluate_sequence_7_configs(
     if packer is None:
         packer = Packer.load_pretrained(DEFAULT_CODEBOOK_PATH, device=device)
 
-    bouncer = Bouncer(
-        threshold=0.10,
-        saliency_gated=True,
-        gamma=1.0,
-        tau_dynamic=0.005,
-        tau_hard_change=0.15,
-        profile="auto",
-        motion_threshold=0.5,
-    )
-    bouncer.reset_edge_cache()
-
-    rebuilder = Rebuilder(packer=packer, device=device)
-
     loader = DAVISSequenceLoader(sequence=sequence, root_dir=root_dir)
     n_frames = len(loader)
-    print(f"\n{'='*70}\n[{sequence.upper()}] Ingesting {n_frames} frames across 7 configurations...\n{'='*70}")
+    print(f"\n{'='*70}\n[{sequence.upper()}] Ingesting {n_frames} frames across configurations...\n{'='*70}")
 
     raw_tokens_stream: List[torch.Tensor] = []
-    gated_tokens_stream: List[torch.Tensor] = []
-    gated_wire_bytes = 0
+    saliencies_list: List[torch.Tensor] = []
+    frames_np_list: List[np.ndarray] = []
     raw_frame_bytes_total = 0
-    active_k_list: List[int] = []
-    prev_frame_np = None
-    frame0_wire_bytes = 0
-    frame0_reconstructed_tokens = None
 
-    # Step 1: Ingest frames, extract ViT tokens, and stream Gated Q=4
+    # Ingestion pass: extract ViT tokens, saliencies, and RGB frames
     for idx, item in enumerate(loader):
         frame_tensor = item.frame.unsqueeze(0).to(device)
         raw_frame_bytes_total += 256 * 384 * 4
 
-        # Slicer: extract raw tokens and saliency
         s_out = slicer(frame_tensor)
-        curr_tokens = s_out.tokens  # [1, 256, 384]
-        saliency = s_out.saliency
-        patch_grid = s_out.patch_grid
+        raw_tokens_stream.append(s_out.tokens.detach().cpu())
+        saliencies_list.append(s_out.saliency.detach().cpu())
 
-        raw_tokens_stream.append(curr_tokens.detach().cpu())
+        frame_u8 = (item.frame.permute(1, 2, 0).numpy() * 255.0).round().astype(np.uint8)
+        frames_np_list.append(frame_u8)
 
-        if idx == 0:
-            # Keyframe: all 256 patches packed with Q=4
-            mask_all = torch.ones(256, dtype=torch.bool, device=device)
-            p_out = packer(
-                curr_tokens[0],
-                mask_all,
-                frame_id=idx,
-                patch_grid=patch_grid,
-                is_keyframe=True,
-                num_quantizers=4,
-            )
-            frame0_wire_bytes = p_out.packet.wire_bytes
-            gated_wire_bytes += frame0_wire_bytes
-            active_k_list.append(256)
-
-            z_hat_0 = p_out.quantized.unsqueeze(0)
-            frame0_reconstructed_tokens = z_hat_0.clone()
-
-            bouncer.initialize_edge_cache(
-                raw_tokens=curr_tokens,
-                reconstructed_tokens=z_hat_0,
-                patch_grid=patch_grid,
-            )
-            rebuilder.initialize_cache(z_hat_0, patch_grid=patch_grid)
-            gated_tokens_stream.append(rebuilder.token_cache.clone().detach().cpu())
-
-            prev_frame_np = (item.frame.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-            continue
-
-        # Differential frames (idx > 0)
-        curr_frame_np = (item.frame.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-        motion = None
-        if prev_frame_np is not None:
-            dx, dy, _ = estimate_global_motion(prev_frame_np, curr_frame_np)
-            motion = (dx, dy)
-        prev_frame_np = curr_frame_np
-
-        # Bouncer: saliency-gated dynamic filtering with Dual-Cache Shadow
-        b_out = bouncer(
-            tokens_current=curr_tokens,
-            tokens_previous=None,
-            patch_grid=patch_grid,
-            saliency=saliency,
-            gamma=1.0,
-            tau_dynamic=0.005,
-            tau_hard_change=0.15,
-            motion=motion,
-            profile="auto",
-        )
-
-        # Packer: compress active tokens with Q=4
-        p_out = packer(
-            z_active=b_out.active_tokens,
-            mask=b_out.mask,
-            frame_id=idx,
-            patch_grid=patch_grid,
-            motion=motion,
-            num_quantizers=4,
-        )
-        gated_wire_bytes += p_out.packet.wire_bytes
-        active_k_list.append(p_out.packet.num_active)
-
-        # Dual-Cache Shadow update
-        bouncer.update_edge_cache(
-            active_reconstructed=p_out.quantized,
-            mask=b_out.mask,
-            active_raw=b_out.active_tokens,
-            motion=motion,
-            patch_grid=patch_grid,
-        )
-
-        # Rebuilder: refresh server cache
-        _ = rebuilder(p_out.packet)
-        gated_tokens_stream.append(rebuilder.token_cache.clone().detach().cpu())
-
-    gated_wire_kbps = compute_bitrate_kbps(gated_wire_bytes, num_frames=n_frames, fps=fps)
     raw_wire_kbps = compute_bitrate_kbps(raw_frame_bytes_total, num_frames=n_frames, fps=fps)
-    mean_k = float(np.mean(active_k_list))
-    mean_k_pct = float(mean_k / 256.0 * 100.0)
 
     # 1. Evaluate Raw ViT Oracle
-    print(f"[{sequence.upper()}] 1/7 Evaluating Raw ViT Oracle...")
+    print(f"[{sequence.upper()}] 1/10 Evaluating Raw ViT Oracle...")
     raw_prop = evaluate_sequence_label_propagation(
         sequence=sequence,
         tokens_stream=raw_tokens_stream,
@@ -406,19 +310,90 @@ def evaluate_sequence_7_configs(
     )
     print(f"[{sequence.upper()}] -> Oracle: J={raw_prop.mean_jaccard:.4f}, F={raw_prop.mean_f_measure:.4f}, Mean J&F={raw_prop.mean_j_and_f:.4f}")
 
-    # 2. Evaluate Gated Q=4 Streamer
-    print(f"[{sequence.upper()}] 2/7 Evaluating Gated Q=4 Streamer ({gated_wire_kbps:.2f} kbps, mean_K={mean_k:.1f}/256)...")
-    gated_prop = evaluate_sequence_label_propagation(
+    # 2. Evaluate Gated Q=4 Streamer (Dual-Cache, 4-stage RVQ)
+    print(f"[{sequence.upper()}] 2/10 Evaluating Gated Q=4 Streamer...")
+    (
+        gated_q4_stream,
+        gated_q4_bytes,
+        gated_q4_kbps,
+        mean_k,
+        mean_k_pct,
+        frame0_rec_q4,
+        frame0_bytes_q4,
+    ) = run_gated_rvq_stream(
+        raw_tokens_stream=raw_tokens_stream,
+        saliencies=saliencies_list,
+        frames_np=frames_np_list,
+        num_quantizers=4,
+        packer=packer,
+        fps=fps,
+        device=device,
+    )
+    gated_q4_prop = evaluate_sequence_label_propagation(
         sequence=sequence,
-        tokens_stream=gated_tokens_stream,
+        tokens_stream=gated_q4_stream,
         root_dir=root_dir,
         device=device,
     )
-    retention_vs_oracle = (gated_prop.mean_j_and_f / raw_prop.mean_j_and_f * 100.0) if raw_prop.mean_j_and_f > 0 else 0.0
-    print(f"[{sequence.upper()}] -> Gated Q=4: J={gated_prop.mean_jaccard:.4f}, F={gated_prop.mean_f_measure:.4f}, Mean J&F={gated_prop.mean_j_and_f:.4f} (Retention: {retention_vs_oracle:.2f}%)")
+    retention_vs_oracle = (gated_q4_prop.mean_j_and_f / raw_prop.mean_j_and_f * 100.0) if raw_prop.mean_j_and_f > 0 else 0.0
+    print(f"[{sequence.upper()}] -> Gated Q=4: J={gated_q4_prop.mean_jaccard:.4f}, F={gated_q4_prop.mean_f_measure:.4f}, Mean J&F={gated_q4_prop.mean_j_and_f:.4f} ({gated_q4_kbps:.2f} kbps, mean_K={mean_k:.1f}/256, Retention: {retention_vs_oracle:.2f}%)")
 
-    # 3. Evaluate Dense Q=1 Control (all 256 patches sent per frame, Q=1)
-    print(f"[{sequence.upper()}] 3/7 Evaluating Dense Q=1 Control (gating OFF)...")
+    # 3. Evaluate Gated Q=2 Streamer (Dual-Cache, 2-stage RVQ)
+    print(f"[{sequence.upper()}] 3/10 Evaluating Gated Q=2 Streamer...")
+    (
+        gated_q2_stream,
+        gated_q2_bytes,
+        gated_q2_kbps,
+        _,
+        _,
+        _,
+        _,
+    ) = run_gated_rvq_stream(
+        raw_tokens_stream=raw_tokens_stream,
+        saliencies=saliencies_list,
+        frames_np=frames_np_list,
+        num_quantizers=2,
+        packer=packer,
+        fps=fps,
+        device=device,
+    )
+    gated_q2_prop = evaluate_sequence_label_propagation(
+        sequence=sequence,
+        tokens_stream=gated_q2_stream,
+        root_dir=root_dir,
+        device=device,
+    )
+    print(f"[{sequence.upper()}] -> Gated Q=2: J={gated_q2_prop.mean_jaccard:.4f}, F={gated_q2_prop.mean_f_measure:.4f}, Mean J&F={gated_q2_prop.mean_j_and_f:.4f} ({gated_q2_kbps:.2f} kbps)")
+
+    # 4. Evaluate Gated Q=1 Streamer (Dual-Cache, 1-stage RVQ)
+    print(f"[{sequence.upper()}] 4/10 Evaluating Gated Q=1 Streamer...")
+    (
+        gated_q1_stream,
+        gated_q1_bytes,
+        gated_q1_kbps,
+        _,
+        _,
+        _,
+        _,
+    ) = run_gated_rvq_stream(
+        raw_tokens_stream=raw_tokens_stream,
+        saliencies=saliencies_list,
+        frames_np=frames_np_list,
+        num_quantizers=1,
+        packer=packer,
+        fps=fps,
+        device=device,
+    )
+    gated_q1_prop = evaluate_sequence_label_propagation(
+        sequence=sequence,
+        tokens_stream=gated_q1_stream,
+        root_dir=root_dir,
+        device=device,
+    )
+    print(f"[{sequence.upper()}] -> Gated Q=1: J={gated_q1_prop.mean_jaccard:.4f}, F={gated_q1_prop.mean_f_measure:.4f}, Mean J&F={gated_q1_prop.mean_j_and_f:.4f} ({gated_q1_kbps:.2f} kbps)")
+
+    # 5. Evaluate Dense Q=1 Control (all 256 patches sent per frame, Q=1)
+    print(f"[{sequence.upper()}] 5/10 Evaluating Dense Q=1 Control (gating OFF)...")
     dense_q1_prop, dense_q1_bytes, dense_q1_kbps = evaluate_dense_rvq_control(
         sequence=sequence,
         raw_tokens_stream=raw_tokens_stream,
@@ -430,8 +405,22 @@ def evaluate_sequence_7_configs(
     )
     print(f"[{sequence.upper()}] -> Dense Q=1: J={dense_q1_prop.mean_jaccard:.4f}, F={dense_q1_prop.mean_f_measure:.4f}, Mean J&F={dense_q1_prop.mean_j_and_f:.4f} ({dense_q1_kbps:.2f} kbps)")
 
-    # 4. Evaluate Dense Q=2 Control (all 256 patches sent per frame, Q=2)
-    print(f"[{sequence.upper()}] 4/7 Evaluating Dense Q=2 Control (gating OFF)...")
+    # 6. Evaluate Dense Q=1 Frame-Skip Control (1/2 rate: every 2nd frame sent)
+    print(f"[{sequence.upper()}] 6/10 Evaluating Dense Q=1 Frame-Skip (1/2 rate)...")
+    dense_q1_skip_prop, dense_q1_skip_bytes, dense_q1_skip_kbps = evaluate_dense_rvq_frame_skip(
+        sequence=sequence,
+        raw_tokens_stream=raw_tokens_stream,
+        packer=packer,
+        num_quantizers=1,
+        skip_interval=2,
+        root_dir=root_dir,
+        fps=fps,
+        device=device,
+    )
+    print(f"[{sequence.upper()}] -> Dense Q=1 Skip: J={dense_q1_skip_prop.mean_jaccard:.4f}, F={dense_q1_skip_prop.mean_f_measure:.4f}, Mean J&F={dense_q1_skip_prop.mean_j_and_f:.4f} ({dense_q1_skip_kbps:.2f} kbps)")
+
+    # 7. Evaluate Dense Q=2 Control (all 256 patches sent per frame, Q=2)
+    print(f"[{sequence.upper()}] 7/10 Evaluating Dense Q=2 Control (gating OFF)...")
     dense_q2_prop, dense_q2_bytes, dense_q2_kbps = evaluate_dense_rvq_control(
         sequence=sequence,
         raw_tokens_stream=raw_tokens_stream,
@@ -443,40 +432,39 @@ def evaluate_sequence_7_configs(
     )
     print(f"[{sequence.upper()}] -> Dense Q=2: J={dense_q2_prop.mean_jaccard:.4f}, F={dense_q2_prop.mean_f_measure:.4f}, Mean J&F={dense_q2_prop.mean_j_and_f:.4f} ({dense_q2_kbps:.2f} kbps)")
 
-    # 5. Evaluate Fair H.264 Baseline at matched bitrate
-    print(f"[{sequence.upper()}] 5/7 Evaluating Fair H.264 Baseline at matched {gated_wire_kbps:.2f} kbps...")
+    # 8. Evaluate Fair H.264 Baseline at matched Gated Q=4 bitrate
+    print(f"[{sequence.upper()}] 8/10 Evaluating Fair H.264 Baseline at matched {gated_q4_kbps:.2f} kbps...")
     h264_res = evaluate_h264_baseline_on_sequence(
         sequence=sequence,
-        target_wire_bytes=gated_wire_bytes,
+        target_wire_bytes=gated_q4_bytes,
         root_dir=root_dir,
         fps=fps,
         slicer=slicer,
         device=device,
     )
-    delta_vs_h264_pct = ((gated_prop.mean_j_and_f - h264_res.h264_j_and_f) / h264_res.h264_j_and_f * 100.0) if h264_res.h264_j_and_f > 0 else 0.0
-    delta_vs_h264_abs = gated_prop.mean_j_and_f - h264_res.h264_j_and_f
+    delta_vs_h264_pct = ((gated_q4_prop.mean_j_and_f - h264_res.h264_j_and_f) / h264_res.h264_j_and_f * 100.0) if h264_res.h264_j_and_f > 0 else 0.0
+    delta_vs_h264_abs = gated_q4_prop.mean_j_and_f - h264_res.h264_j_and_f
     print(f"[{sequence.upper()}] -> H.264: J={h264_res.h264_jaccard:.4f}, F={h264_res.h264_f_measure:.4f}, Mean J&F={h264_res.h264_j_and_f:.4f} (Achieved: {h264_res.achieved_kbps:.2f} kbps, Delta: {delta_vs_h264_pct:+.2f}%)")
 
-    # 6. Evaluate Floor A (Frozen Cache: Frame 0 keyframe, 0 updates subsequent)
-    print(f"[{sequence.upper()}] 6/7 Evaluating Floor A (Frozen Cache)...")
-    assert frame0_reconstructed_tokens is not None
+    # 9. Evaluate Floor A (Frozen Cache: Frame 0 keyframe, 0 updates subsequent)
+    print(f"[{sequence.upper()}] 9/10 Evaluating Floor A (Frozen Cache)...")
     floor_a_prop, floor_a_bytes, floor_a_kbps = evaluate_frozen_cache_baseline(
         sequence=sequence,
-        frame0_reconstructed_tokens=frame0_reconstructed_tokens,
+        frame0_reconstructed_tokens=frame0_rec_q4,
         num_frames=n_frames,
-        frame0_wire_bytes=frame0_wire_bytes,
+        frame0_wire_bytes=frame0_bytes_q4,
         root_dir=root_dir,
         fps=fps,
         device=device,
     )
     print(f"[{sequence.upper()}] -> Floor A: J={floor_a_prop.mean_jaccard:.4f}, F={floor_a_prop.mean_f_measure:.4f}, Mean J&F={floor_a_prop.mean_j_and_f:.4f} ({floor_a_kbps:.2f} kbps)")
 
-    # 7. Evaluate Floor B (Copy Frame 0 GT Mask forward)
-    print(f"[{sequence.upper()}] 7/7 Evaluating Floor B (Copy Frame 0 Mask forward)...")
+    # 10. Evaluate Floor B (Copy Frame 0 GT Mask forward)
+    print(f"[{sequence.upper()}] 10/10 Evaluating Floor B (Copy Frame 0 Mask forward)...")
     floor_b_res = compute_floor_b_copy_mask(
         sequence=sequence,
         root_dir=root_dir,
-        bound_th=2.0,
+        bound_th=None,
     )
     print(f"[{sequence.upper()}] -> Floor B: J={floor_b_res.mean_jaccard:.4f}, F={floor_b_res.mean_f_measure:.4f}, Mean J&F={floor_b_res.mean_j_and_f:.4f} (0.00 kbps)")
 
@@ -487,11 +475,11 @@ def evaluate_sequence_7_configs(
         raw_j=raw_prop.mean_jaccard,
         raw_f=raw_prop.mean_f_measure,
         raw_kbps=raw_wire_kbps,
-        gated_q4_jf=gated_prop.mean_j_and_f,
-        gated_q4_j=gated_prop.mean_jaccard,
-        gated_q4_f=gated_prop.mean_f_measure,
-        gated_q4_kbps=gated_wire_kbps,
-        gated_q4_wire_bytes=gated_wire_bytes,
+        gated_q4_jf=gated_q4_prop.mean_j_and_f,
+        gated_q4_j=gated_q4_prop.mean_jaccard,
+        gated_q4_f=gated_q4_prop.mean_f_measure,
+        gated_q4_kbps=gated_q4_kbps,
+        gated_q4_wire_bytes=gated_q4_bytes,
         mean_k=mean_k,
         mean_k_pct=mean_k_pct,
         retention_vs_oracle_pct=retention_vs_oracle,
@@ -521,6 +509,21 @@ def evaluate_sequence_7_configs(
         floor_b_j=floor_b_res.mean_jaccard,
         floor_b_f=floor_b_res.mean_f_measure,
         floor_b_kbps=0.0,
+        gated_q2_jf=gated_q2_prop.mean_j_and_f,
+        gated_q2_j=gated_q2_prop.mean_jaccard,
+        gated_q2_f=gated_q2_prop.mean_f_measure,
+        gated_q2_kbps=gated_q2_kbps,
+        gated_q2_wire_bytes=gated_q2_bytes,
+        gated_q1_jf=gated_q1_prop.mean_j_and_f,
+        gated_q1_j=gated_q1_prop.mean_jaccard,
+        gated_q1_f=gated_q1_prop.mean_f_measure,
+        gated_q1_kbps=gated_q1_kbps,
+        gated_q1_wire_bytes=gated_q1_bytes,
+        dense_q1_skip_jf=dense_q1_skip_prop.mean_j_and_f,
+        dense_q1_skip_j=dense_q1_skip_prop.mean_jaccard,
+        dense_q1_skip_f=dense_q1_skip_prop.mean_f_measure,
+        dense_q1_skip_kbps=dense_q1_skip_kbps,
+        dense_q1_skip_wire_bytes=dense_q1_skip_bytes,
     )
 
 
