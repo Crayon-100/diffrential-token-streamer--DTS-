@@ -165,7 +165,7 @@ class DINOv2LabelPropagator:
         memory_queue_size: int = 3,
         locality_radius: float = 4.0,
         mask_threshold: float = 0.35,
-        upsample_size: Tuple[int, int] = (480, 854),
+        upsample_size: Optional[Tuple[int, int]] = None,
         device: Optional[Union[str, torch.device]] = None,
     ) -> None:
         """Initialize the sensitive label propagator.
@@ -176,7 +176,7 @@ class DINOv2LabelPropagator:
             memory_queue_size: Number of recent frame predictions to retain (default: M=3).
             locality_radius: Spatial search radius in patches around previous mask (default: R=4.0).
             mask_threshold: Binary probability threshold after soft upsampling (default: 0.35).
-            upsample_size: Target native output resolution (default: (480, 854)).
+            upsample_size: Target native output resolution (default: None, inferred from mask).
             device: Torch computation device.
         """
         self.top_k = int(top_k)
@@ -190,6 +190,7 @@ class DINOv2LabelPropagator:
         # Anchor Keyframe (Frame 0)
         self.anchor_tokens: Optional[torch.Tensor] = None
         self.anchor_labels: Optional[torch.Tensor] = None
+        self.mask_size: Tuple[int, int] = (224, 224)
 
         # Temporal Context Queue (recent frames t-1, t-2, ...)
         self.queue_tokens: List[torch.Tensor] = []
@@ -201,6 +202,16 @@ class DINOv2LabelPropagator:
             torch.arange(16, device=self.device), torch.arange(16, device=self.device), indexing="ij"
         )
         self.coords = torch.stack([grid_y.flatten(), grid_x.flatten()], dim=-1).float()  # [256, 2]
+
+    @property
+    def memory_tokens(self) -> Optional[torch.Tensor]:
+        """Backwards compatibility alias for Frame 0 anchor tokens."""
+        return self.anchor_tokens
+
+    @property
+    def memory_labels(self) -> Optional[torch.Tensor]:
+        """Backwards compatibility alias for Frame 0 anchor labels."""
+        return self.anchor_labels
 
     def initialize(
         self,
@@ -225,12 +236,14 @@ class DINOv2LabelPropagator:
             m_t = frame0_mask
 
         m_t = m_t.to(self.device).float()
-        if m_t.ndim == 2 and m_t.shape != (16, 16):
-            # Soft continuous pooling from high-resolution mask: [1, 1, H, W] -> [16, 16]
-            m_pooled = F.adaptive_avg_pool2d(m_t.unsqueeze(0).unsqueeze(0), (16, 16))
-            labels = m_pooled.squeeze().flatten()  # [256] in [0, 1]
-        elif m_t.ndim == 2 and m_t.shape == (16, 16):
-            labels = m_t.flatten()
+        if m_t.ndim == 2:
+            self.mask_size = (int(m_t.shape[0]), int(m_t.shape[1]))
+            if m_t.shape != (16, 16):
+                # Soft continuous pooling from high-resolution mask: [1, 1, H, W] -> [16, 16]
+                m_pooled = F.adaptive_avg_pool2d(m_t.unsqueeze(0).unsqueeze(0), (16, 16))
+                labels = m_pooled.squeeze().flatten()  # [256] in [0, 1]
+            else:
+                labels = m_t.flatten()
         else:
             labels = m_t.flatten().float()
 
@@ -296,7 +309,9 @@ class DINOv2LabelPropagator:
         pred_prob_grid = pred_prob_gated.view(1, 1, 16, 16)
 
         # 6. Soft Probability Bilinear Upsampling to native resolution before thresholding
-        target_size = upsample_size if upsample_size is not None else self.upsample_size
+        target_size = upsample_size if upsample_size is not None else (
+            self.upsample_size if self.upsample_size is not None else getattr(self, "mask_size", (224, 224))
+        )
         pred_prob_pixel = F.interpolate(
             pred_prob_grid, size=target_size, mode="bilinear", align_corners=False
         )
@@ -312,7 +327,7 @@ class DINOv2LabelPropagator:
             self.queue_labels.append(pred_prob_gated.detach())
             self.prev_mask = (pred_prob_gated > 0.20)
 
-        return pred_pixel_u8, pred_grid_bool, pred_prob_gated.view(16, 16)
+        return pred_pixel_u8, pred_grid_bool
 
     def reset(self) -> None:
         """Clears memory bank and queue."""
@@ -388,7 +403,7 @@ def evaluate_sequence_label_propagation(
         item_t = loader[t]
         gt_pixel = item_t.gt_mask_native.numpy().astype(np.uint8) if item_t.gt_mask_native is not None else item_t.gt_mask_pixel.numpy().astype(np.uint8)
 
-        pred_pixel, _, _ = propagator.propagate(
+        pred_pixel, _ = propagator.propagate(
             tokens_t,
             upsample_size=native_size,
             update_memory=True,
