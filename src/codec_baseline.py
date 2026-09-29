@@ -60,16 +60,22 @@ def compute_bitrate_kbps(total_wire_bytes: int, num_frames: int, fps: float = 25
 def encode_frames_to_h264(
     frames_rgb: List[np.ndarray],
     target_kbps: float,
-    output_mp4_path: str,
+    output_path: str,
     fps: float = 25.0,
+    gop: int = 250,
+    lossless: bool = False,
+    qp: Optional[int] = None,
 ) -> int:
-    """Encodes a sequence of RGB frames [H, W, 3] to H.264 using FFmpeg libx264.
+    """Encodes a sequence of RGB frames [H, W, 3] to Annex-B H.264 using FFmpeg libx264.
 
     Args:
         frames_rgb: List of RGB uint8 numpy arrays of shape (H, W, 3).
         target_kbps: Target bitrate in kbps.
-        output_mp4_path: Filepath to write the MP4 container.
+        output_path: Filepath to write the raw Annex-B stream (.h264).
         fps: Frame rate (default: 25.0).
+        gop: Group of Pictures keyframe interval (default: 250).
+        lossless: If True, uses lossless encoding (-qp 0 -pix_fmt yuv444p).
+        qp: Optional quantization parameter override (0 for lossless).
 
     Returns:
         Encoded file size in bytes.
@@ -82,29 +88,47 @@ def encode_frames_to_h264(
 
     ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
 
-    # Calculate bitrates and buffer sizes (clamp target_kbps to minimum 10 kbps)
-    bitrate_int = max(10, int(round(target_kbps)))
-    bufsize_int = max(20, bitrate_int * 2)
+    if lossless or (qp is not None and qp == 0):
+        cmd = [
+            ffmpeg_exe,
+            "-y",
+            "-f", "rawvideo",
+            "-vcodec", "rawvideo",
+            "-s", f"{w}x{h}",
+            "-pix_fmt", "rgb24",
+            "-r", str(fps),
+            "-i", "-",
+            "-c:v", "libx264",
+            "-qp", "0",
+            "-preset", "ultrafast",
+            "-pix_fmt", "yuv444p",
+            "-f", "h264",
+            output_path,
+        ]
+    else:
+        # Calculate bitrates and buffer sizes (clamp target_kbps to minimum 10 kbps)
+        bitrate_int = max(10, int(round(target_kbps)))
+        bufsize_int = max(20, bitrate_int * 2)
 
-    cmd = [
-        ffmpeg_exe,
-        "-y",
-        "-f", "rawvideo",
-        "-vcodec", "rawvideo",
-        "-s", f"{w}x{h}",
-        "-pix_fmt", "rgb24",
-        "-r", str(fps),
-        "-i", "-",
-        "-c:v", "libx264",
-        "-b:v", f"{bitrate_int}k",
-        "-maxrate", f"{bitrate_int}k",
-        "-bufsize", f"{bufsize_int}k",
-        "-preset", "medium",
-        "-g", "25",
-        "-keyint_min", "25",
-        "-pix_fmt", "yuv420p",
-        output_mp4_path,
-    ]
+        cmd = [
+            ffmpeg_exe,
+            "-y",
+            "-f", "rawvideo",
+            "-vcodec", "rawvideo",
+            "-s", f"{w}x{h}",
+            "-pix_fmt", "rgb24",
+            "-r", str(fps),
+            "-i", "-",
+            "-c:v", "libx264",
+            "-b:v", f"{bitrate_int}k",
+            "-maxrate", f"{bitrate_int}k",
+            "-bufsize", f"{bufsize_int}k",
+            "-preset", "medium",
+            "-g", str(gop),
+            "-pix_fmt", "yuv420p",
+            "-f", "h264",
+            output_path,
+        ]
 
     # Stream frames into FFmpeg stdin
     process = subprocess.Popen(
@@ -118,30 +142,52 @@ def encode_frames_to_h264(
     stdout, stderr = process.communicate(input=raw_bytes)
 
     if process.returncode != 0:
-        raise RuntimeError(f"FFmpeg encoding failed with code {process.returncode}:\n{stderr.decode('utf-8', errors='ignore')}")
+        raise RuntimeError(
+            f"FFmpeg encoding failed with code {process.returncode}:\n{stderr.decode('utf-8', errors='ignore')}"
+        )
 
-    out_file = Path(output_mp4_path)
+    out_file = Path(output_path)
     if not out_file.exists():
-        raise FileNotFoundError(f"Encoded H.264 file was not created: {output_mp4_path}")
+        raise FileNotFoundError(f"Encoded H.264 file was not created: {output_path}")
 
     return out_file.stat().st_size
 
 
-def decode_h264_to_frames(mp4_path: str) -> List[np.ndarray]:
-    """Decodes an H.264 MP4 file back into a list of RGB uint8 numpy frames."""
-    cap = cv2.VideoCapture(str(mp4_path))
-    if not cap.isOpened():
-        raise RuntimeError(f"Failed to open video file for decoding: {mp4_path}")
+def decode_h264_to_frames(
+    h264_path: str,
+    expected_frames: Optional[int] = None,
+    width: int = 224,
+    height: int = 224,
+) -> List[np.ndarray]:
+    """Decodes a raw Annex-B H.264 file back into a list of RGB uint8 numpy frames."""
+    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    cmd = [
+        ffmpeg_exe,
+        "-i", str(h264_path),
+        "-f", "rawvideo",
+        "-pix_fmt", "rgb24",
+        "-",
+    ]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    out_bytes, stderr = proc.communicate()
 
-    frames: List[np.ndarray] = []
-    while True:
-        ret, frame_bgr = cap.read()
-        if not ret or frame_bgr is None:
-            break
-        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        frames.append(frame_rgb)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"FFmpeg decoding failed with code {proc.returncode}:\n{stderr.decode('utf-8', errors='ignore')}"
+        )
 
-    cap.release()
+    frame_size = width * height * 3
+    n_decoded = len(out_bytes) // frame_size
+    frames: List[np.ndarray] = [
+        np.frombuffer(out_bytes[i * frame_size : (i + 1) * frame_size], dtype=np.uint8).reshape(height, width, 3)
+        for i in range(n_decoded)
+    ]
+
+    if expected_frames is not None:
+        assert len(frames) == expected_frames, (
+            f"Decoded frame count mismatch: expected {expected_frames}, decoded {len(frames)}"
+        )
+
     return frames
 
 
@@ -150,16 +196,18 @@ def evaluate_h264_baseline_on_sequence(
     target_wire_bytes: int,
     root_dir: str = "data/DAVIS",
     fps: float = 25.0,
+    gop: int = 250,
+    lossless: bool = False,
     slicer: Optional[DINOv2Slicer] = None,
     device: Optional[torch.device] = None,
 ) -> CodecBaselineResult:
     """Evaluates H.264 video compression at matched bitrate on a DAVIS sequence.
 
     Steps:
-    1. Loads raw RGB frames from sequence.
+    1. Loads raw RGB frames from sequence with pixel parity (Image.BILINEAR pre-scaled).
     2. Computes target bitrate in kbps matching `target_wire_bytes`.
-    3. Encodes frames to H.264 (libx264).
-    4. Decodes compressed frames back to RGB.
+    3. Encodes frames to Annex-B H.264 (raw bitstream without MP4 container overhead).
+    4. Decodes compressed frames back to RGB and asserts exact frame count.
     5. Extracts DINOv2 patch tokens from compressed frames.
     6. Runs semi-supervised label propagation and evaluates J&F.
     """
@@ -172,28 +220,37 @@ def evaluate_h264_baseline_on_sequence(
     loader = DAVISSequenceLoader(sequence=sequence, root_dir=root_dir)
     n_frames = len(loader)
 
-    # Ingest original raw RGB frames
-    raw_rgb_frames = [loader[i].raw_image.resize((224, 224)) for i in range(n_frames)]
-    np_rgb_frames = [np.array(img, dtype=np.uint8) for img in raw_rgb_frames]
+    # Pixel Parity: Feed H.264 the exact same Image.BILINEAR pre-scaled pixels as the Oracle
+    np_rgb_frames = [
+        (loader[i].frame.permute(1, 2, 0).cpu().numpy() * 255.0).round().astype(np.uint8)
+        for i in range(n_frames)
+    ]
 
     # Calculate target bitrate
     target_kbps = compute_bitrate_kbps(target_wire_bytes, num_frames=n_frames, fps=fps)
 
-    # Encode with FFmpeg libx264 in a temporary MP4 file
-    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_mp4:
-        tmp_path = tmp_mp4.name
+    # Encode with FFmpeg libx264 in a temporary Annex-B .h264 file
+    with tempfile.NamedTemporaryFile(suffix=".h264", delete=False) as tmp_f:
+        tmp_path = tmp_f.name
 
     try:
         encoded_size = encode_frames_to_h264(
             frames_rgb=np_rgb_frames,
             target_kbps=target_kbps,
-            output_mp4_path=tmp_path,
+            output_path=tmp_path,
             fps=fps,
+            gop=gop,
+            lossless=lossless,
         )
         achieved_kbps = compute_bitrate_kbps(encoded_size, num_frames=n_frames, fps=fps)
 
-        # Decode compressed video back into RGB frames
-        decoded_rgb_frames = decode_h264_to_frames(tmp_path)
+        # Decode compressed video back into RGB frames and assert count
+        decoded_rgb_frames = decode_h264_to_frames(
+            tmp_path,
+            expected_frames=n_frames,
+            width=224,
+            height=224,
+        )
     finally:
         if os.path.exists(tmp_path):
             try:
@@ -229,3 +286,4 @@ def evaluate_h264_baseline_on_sequence(
         h264_j_and_f=prop_result.mean_j_and_f,
         propagation_result=prop_result,
     )
+
