@@ -15,6 +15,7 @@ if root_dir not in sys.path:
 from src.dense_control import (
     compute_floor_b_copy_mask,
     evaluate_dense_rvq_control,
+    evaluate_dense_rvq_frame_skip,
     evaluate_frozen_cache_baseline,
     FloorBResult,
 )
