@@ -487,6 +487,7 @@ class Packer(nn.Module):
         patch_grid: Optional[Tuple[int, int]] = None,
         motion: Optional[Tuple[float, float]] = None,
         is_keyframe: bool = False,
+        num_quantizers: Optional[int] = None,
     ) -> PackerOutput:
         """Packs active tokens and spatial mask into a true binary transmission packet.
 
@@ -497,6 +498,7 @@ class Packer(nn.Module):
             patch_grid: Spatial patch dimensions (H_p, W_p).
             motion: Optional camera translation tuple (dx, dy) in pixels.
             is_keyframe: True if keyframe (all patches active), False if delta frame.
+            num_quantizers: Optional override for number of RVQ codebook stages (e.g. 1 or 2).
 
         Returns:
             PackerOutput containing indices, quantized approximation, loss, and TransmissionPacket.
@@ -511,6 +513,11 @@ class Packer(nn.Module):
 
         # 1. Quantize dynamic tokens
         quantized, indices, commit_loss = self.quantize(z_active)
+
+        eff_num_quantizers = self.num_quantizers if num_quantizers is None else int(num_quantizers)
+        if eff_num_quantizers < self.num_quantizers and k_active > 0:
+            indices = indices[:, :eff_num_quantizers]
+            quantized = self.decode(indices)
 
         # 2. Pack boolean spatial mask into bits
         packed_mask = self.pack_boolean_mask(mask_flat)
@@ -532,7 +539,7 @@ class Packer(nn.Module):
             frame_id=frame_id,
             num_patches=n_patches,
             num_active=k_active,
-            num_quantizers=self.num_quantizers,
+            num_quantizers=eff_num_quantizers,
             codebook_size=self.codebook_size,
             patch_grid=patch_grid,
             packed_mask=packed_mask,
@@ -553,7 +560,7 @@ class Packer(nn.Module):
             frame_id=frame_id,
             num_patches=n_patches,
             num_active=k_active,
-            num_quantizers=self.num_quantizers,
+            num_quantizers=eff_num_quantizers,
             codebook_size=self.codebook_size,
             patch_grid=patch_grid,
             packed_mask=packed_mask,
@@ -573,3 +580,4 @@ class Packer(nn.Module):
             commit_loss=commit_loss,
             packet=packet,
         )
+
