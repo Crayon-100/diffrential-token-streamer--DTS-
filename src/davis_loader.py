@@ -23,6 +23,8 @@ class DAVISFrameItem:
     frame_name: str                 # e.g. '00000.jpg'
     frame_idx: int                  # 0, 1, 2, ...
     raw_image: Image.Image          # Original PIL Image for visualization
+    gt_mask_native: Optional[torch.Tensor] = None # Native 480p binary pixel mask [H_orig, W_orig]
+    native_size: Tuple[int, int] = (480, 854)     # (H_orig, W_orig)
 
 
 class DAVISSequenceLoader:
@@ -114,6 +116,9 @@ class DAVISSequenceLoader:
         # Load Annotation Mask
         if anno_path is not None and anno_path.exists():
             raw_mask = Image.open(anno_path)
+            native_w, native_h = raw_mask.size
+            native_size = (native_h, native_w)
+            native_mask = torch.from_numpy(np.array(raw_mask) > 0).bool()
             resized_mask = raw_mask.resize(self.image_size, Image.NEAREST)
             mask_np = np.array(resized_mask)
             # Binary mask: foreground > 0
@@ -123,6 +128,8 @@ class DAVISSequenceLoader:
             )
         else:
             # Fallback if no annotation file
+            native_size = (480, 854)
+            native_mask = torch.zeros(native_size, dtype=torch.bool)
             binary_mask = torch.zeros(self.image_size, dtype=torch.float32)
             h_p = self.image_size[0] // self.patch_size
             w_p = self.image_size[1] // self.patch_size
@@ -135,7 +142,10 @@ class DAVISSequenceLoader:
             frame_name=frame_path.name,
             frame_idx=idx,
             raw_image=raw_img,
+            gt_mask_native=native_mask,
+            native_size=native_size,
         )
+
 
     def __iter__(self) -> Iterator[DAVISFrameItem]:
         for i in range(len(self)):
