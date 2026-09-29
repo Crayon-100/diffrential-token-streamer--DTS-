@@ -462,13 +462,17 @@ class Packer(nn.Module):
             return torch.empty((0, self.dim), dtype=torch.float32, device=self.device)
 
         idx = indices.to(self.device)
-        if orig_dim == 2:
-            idx = idx.unsqueeze(0)  # [1, K, Q]
+        q_stages = idx.shape[-1]
 
-        recon = self.rvq.get_output_from_indices(idx)
+        # Sliced embedding lookup: exact reconstruction for any 1 <= q_stages <= num_quantizers
+        idx_2d = idx.view(-1, q_stages)
+        recon_flat = torch.zeros((idx_2d.shape[0], self.dim), dtype=torch.float32, device=self.device)
+        num_layers = len(self.rvq.layers)
+        for stage in range(min(q_stages, num_layers)):
+            embed = self.rvq.layers[stage]._codebook.embed.squeeze(0)
+            recon_flat = recon_flat + embed[idx_2d[:, stage]]
 
-        if orig_dim == 2:
-            recon = recon.squeeze(0)  # [K, D]
+        recon = recon_flat.view(*idx.shape[:-1], self.dim)
 
         if self.normalize_tokens:
             recon = recon * self.mean_token_norm
