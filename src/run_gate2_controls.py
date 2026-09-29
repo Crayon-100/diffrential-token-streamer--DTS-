@@ -42,6 +42,7 @@ from src.davis_loader import DAVISSequenceLoader
 from src.dense_control import (
     compute_floor_b_copy_mask,
     evaluate_dense_rvq_control,
+    evaluate_dense_rvq_frame_skip,
     evaluate_frozen_cache_baseline,
     FloorBResult,
 )
@@ -57,7 +58,7 @@ from src.slicer import DINOv2Slicer
 
 @dataclass
 class SequenceControlsEvaluation:
-    """Consolidated 7-configuration evaluation results for a single sequence."""
+    """Consolidated multi-configuration evaluation results for a single sequence."""
     sequence: str
     num_frames: int
 
@@ -77,7 +78,7 @@ class SequenceControlsEvaluation:
     mean_k_pct: float
     retention_vs_oracle_pct: float
 
-    # 3. Dense Q=1 Control
+    # 3. Dense Q=1 Control (full rate)
     dense_q1_jf: float
     dense_q1_j: float
     dense_q1_f: float
@@ -111,7 +112,152 @@ class SequenceControlsEvaluation:
     floor_b_jf: float
     floor_b_j: float
     floor_b_f: float
-    floor_b_kbps: float
+    floor_b_kbps: float = 0.0
+
+    # Low-bitrate additions (with defaults for backwards compatibility)
+    gated_q2_jf: float = 0.0
+    gated_q2_j: float = 0.0
+    gated_q2_f: float = 0.0
+    gated_q2_kbps: float = 0.0
+    gated_q2_wire_bytes: int = 0
+
+    gated_q1_jf: float = 0.0
+    gated_q1_j: float = 0.0
+    gated_q1_f: float = 0.0
+    gated_q1_kbps: float = 0.0
+    gated_q1_wire_bytes: int = 0
+
+    dense_q1_skip_jf: float = 0.0
+    dense_q1_skip_j: float = 0.0
+    dense_q1_skip_f: float = 0.0
+    dense_q1_skip_kbps: float = 0.0
+    dense_q1_skip_wire_bytes: int = 0
+
+
+def run_gated_rvq_stream(
+    raw_tokens_stream: List[torch.Tensor],
+    saliencies: List[torch.Tensor],
+    frames_np: List[np.ndarray],
+    num_quantizers: int,
+    packer: Packer,
+    fps: float = 25.0,
+    device: Optional[torch.device] = None,
+) -> Tuple[List[torch.Tensor], int, float, float, float, torch.Tensor, int]:
+    """Runs saliency-gated dynamic token streaming with specified RVQ quantizer stages.
+
+    Returns:
+        Tuple of (gated_tokens_stream, wire_bytes, wire_kbps, mean_k, mean_k_pct, frame0_reconstructed, frame0_bytes)
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    bouncer = Bouncer(
+        threshold=0.10,
+        saliency_gated=True,
+        gamma=1.0,
+        tau_dynamic=0.005,
+        tau_hard_change=0.15,
+        profile="auto",
+        motion_threshold=0.5,
+    )
+    bouncer.reset_edge_cache()
+    rebuilder = Rebuilder(packer=packer, device=device)
+
+    gated_tokens_stream: List[torch.Tensor] = []
+    gated_wire_bytes = 0
+    active_k_list: List[int] = []
+    prev_frame_np = None
+    frame0_wire_bytes = 0
+    frame0_rec = None
+    n_frames = len(raw_tokens_stream)
+
+    for idx in range(n_frames):
+        curr_tokens = raw_tokens_stream[idx].to(device)
+        saliency = saliencies[idx].to(device)
+        curr_frame_np = frames_np[idx]
+        patch_grid = (16, 16)
+
+        if idx == 0:
+            mask_all = torch.ones(256, dtype=torch.bool, device=device)
+            p_out = packer(
+                curr_tokens[0],
+                mask_all,
+                frame_id=idx,
+                patch_grid=patch_grid,
+                is_keyframe=True,
+                num_quantizers=num_quantizers,
+            )
+            frame0_wire_bytes = p_out.packet.wire_bytes
+            gated_wire_bytes += frame0_wire_bytes
+            active_k_list.append(256)
+
+            z_hat_0 = p_out.quantized.unsqueeze(0)
+            frame0_rec = z_hat_0.clone()
+
+            bouncer.initialize_edge_cache(
+                raw_tokens=curr_tokens,
+                reconstructed_tokens=z_hat_0,
+                patch_grid=patch_grid,
+            )
+            rebuilder.initialize_cache(z_hat_0, patch_grid=patch_grid)
+            gated_tokens_stream.append(rebuilder.token_cache.clone().detach().cpu())
+            prev_frame_np = curr_frame_np
+            continue
+
+        motion = None
+        if prev_frame_np is not None:
+            dx, dy, _ = estimate_global_motion(prev_frame_np, curr_frame_np)
+            motion = (dx, dy)
+        prev_frame_np = curr_frame_np
+
+        b_out = bouncer(
+            tokens_current=curr_tokens,
+            tokens_previous=None,
+            patch_grid=patch_grid,
+            saliency=saliency,
+            gamma=1.0,
+            tau_dynamic=0.005,
+            tau_hard_change=0.15,
+            motion=motion,
+            profile="auto",
+        )
+
+        p_out = packer(
+            z_active=b_out.active_tokens,
+            mask=b_out.mask,
+            frame_id=idx,
+            patch_grid=patch_grid,
+            motion=motion,
+            num_quantizers=num_quantizers,
+        )
+        gated_wire_bytes += p_out.packet.wire_bytes
+        active_k_list.append(p_out.packet.num_active)
+
+        bouncer.update_edge_cache(
+            active_reconstructed=p_out.quantized,
+            mask=b_out.mask,
+            active_raw=b_out.active_tokens,
+            motion=motion,
+            patch_grid=patch_grid,
+        )
+
+        _ = rebuilder(p_out.packet)
+        gated_tokens_stream.append(rebuilder.token_cache.clone().detach().cpu())
+
+    gated_wire_kbps = compute_bitrate_kbps(gated_wire_bytes, num_frames=n_frames, fps=fps)
+    mean_k = float(np.mean(active_k_list))
+    mean_k_pct = float(mean_k / 256.0 * 100.0)
+
+    assert frame0_rec is not None
+    return (
+        gated_tokens_stream,
+        gated_wire_bytes,
+        gated_wire_kbps,
+        mean_k,
+        mean_k_pct,
+        frame0_rec,
+        frame0_wire_bytes,
+    )
 
 
 def evaluate_sequence_7_configs(
