@@ -177,3 +177,106 @@ class TestGate2Controls:
         assert "+25.00%" in report
         assert "Median Delta vs H.264" in report
         assert report_file.exists()
+
+    def test_dense_rvq_frame_skip(self):
+        """Dense RVQ frame-skipping (1/2 rate) must reduce wire bytes by ~50%."""
+        dummy_tokens = [torch.randn(1, 256, 384, device=self.device) for _ in range(10)]
+        prop_res, total_bytes, kbps = evaluate_dense_rvq_frame_skip(
+            sequence="blackswan",
+            raw_tokens_stream=dummy_tokens,
+            packer=self.packer,
+            num_quantizers=1,
+            skip_interval=2,
+            root_dir="data/DAVIS",
+            fps=25.0,
+            device=self.device,
+        )
+        assert prop_res.num_frames == 9  # 10 frames total, 9 evaluated
+        # 10 frames with skip_interval=2: frames 0, 2, 4, 6, 8 transmitted = 5 packets
+        # Frame 0: 306 bytes, Frame 2, 4, 6, 8: 306 bytes each -> 5 * 306 = 1530 bytes
+        assert total_bytes == 5 * 306
+        assert 0.0 <= prop_res.mean_j_and_f <= 1.0
+
+    def test_lossless_codec_control(self, tmp_path):
+        """Lossless H.264 (-qp 0 -pix_fmt yuv444p) J&F must match Raw ViT Oracle within 0.005 tolerance."""
+        import tempfile
+        from src.davis_loader import DAVISSequenceLoader
+        from src.slicer import DINOv2Slicer
+        from src.codec_baseline import encode_frames_to_h264, decode_h264_to_frames
+        from src.label_propagation import evaluate_sequence_label_propagation
+
+        slicer = DINOv2Slicer(device=self.device)
+        loader = DAVISSequenceLoader(sequence="blackswan", root_dir="data/DAVIS")
+        num_test_frames = 10
+
+        raw_frames_rgb: List[np.ndarray] = []
+        raw_tokens_stream: List[torch.Tensor] = []
+
+        for i in range(num_test_frames):
+            item = loader[i]
+            frame_u8 = (item.frame.permute(1, 2, 0).numpy() * 255).round().astype(np.uint8)
+            raw_frames_rgb.append(frame_u8)
+
+            frame_tensor = item.frame.unsqueeze(0).to(self.device)
+            s_out = slicer(frame_tensor)
+            raw_tokens_stream.append(s_out.tokens.detach().cpu())
+
+        # Evaluate Raw ViT Oracle on the 10 frames
+        oracle_prop = evaluate_sequence_label_propagation(
+            sequence="blackswan",
+            tokens_stream=raw_tokens_stream,
+            root_dir="data/DAVIS",
+            device=self.device,
+        )
+
+        # Encode losslessly with FFmpeg libx264 (-qp 0 -pix_fmt yuv444p)
+        h264_file = tmp_path / "lossless_test.h264"
+        file_bytes = encode_frames_to_h264(
+            frames_rgb=raw_frames_rgb,
+            target_kbps=0.0,
+            output_path=str(h264_file),
+            fps=25.0,
+            lossless=True,
+            qp=0,
+        )
+        assert file_bytes > 0
+        assert h264_file.exists()
+
+        # Decode lossless stream
+        decoded_frames = decode_h264_to_frames(
+            str(h264_file),
+            expected_frames=num_test_frames,
+            width=224,
+            height=224,
+        )
+        assert len(decoded_frames) == num_test_frames
+
+        # Extract tokens from decoded frames
+        lossless_tokens_stream: List[torch.Tensor] = []
+        for dec_frame in decoded_frames:
+            dec_t = torch.from_numpy(dec_frame).permute(2, 0, 1).unsqueeze(0).to(self.device)
+            s_out = slicer(dec_t)
+            lossless_tokens_stream.append(s_out.tokens.detach().cpu())
+
+        # Evaluate label propagation on lossless decoded tokens
+        lossless_prop = evaluate_sequence_label_propagation(
+            sequence="blackswan",
+            tokens_stream=lossless_tokens_stream,
+            root_dir="data/DAVIS",
+            device=self.device,
+        )
+
+        # Verify token fidelity and J&F parity within 0.005 tolerance
+        cos_sims = [
+            float(torch.nn.functional.cosine_similarity(raw_tokens_stream[i], lossless_tokens_stream[i], dim=-1).mean())
+            for i in range(num_test_frames)
+        ]
+        avg_cos_sim = float(np.mean(cos_sims))
+        assert avg_cos_sim > 0.995, f"Expected near-perfect cosine similarity, got {avg_cos_sim:.5f}"
+
+        jf_diff = abs(lossless_prop.mean_j_and_f - oracle_prop.mean_j_and_f)
+        assert jf_diff < 0.005, (
+            f"Lossless J&F ({lossless_prop.mean_j_and_f:.4f}) diverged from "
+            f"Oracle J&F ({oracle_prop.mean_j_and_f:.4f}) by {jf_diff:.4f} >= 0.005"
+        )
+
