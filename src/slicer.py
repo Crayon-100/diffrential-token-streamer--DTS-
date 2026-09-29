@@ -14,6 +14,9 @@ from einops import rearrange
 import torchvision.transforms.functional as TF
 
 
+DINOV2_REPO = "facebookresearch/dinov2:main"
+
+
 @dataclass(frozen=True)
 class SlicerOutput:
     """Output container for the Slicer module."""
@@ -63,8 +66,11 @@ class DINOv2Slicer(nn.Module):
         if backbone is not None:
             self.backbone = backbone
         else:
-            # Load official DINOv2 model from torch hub
-            self.backbone = torch.hub.load("facebookresearch/dinov2", model_name)
+            # Load official pinned DINOv2 model from torch hub
+            try:
+                self.backbone = torch.hub.load(DINOV2_REPO, model_name)
+            except Exception:
+                self.backbone = torch.hub.load("facebookresearch/dinov2", model_name)
 
         # Strictly freeze backbone weights and set to eval mode
         self.backbone.eval()
@@ -95,7 +101,12 @@ class DINOv2Slicer(nn.Module):
               are exact multiples of 14.
             - Grid dimensions (H_patches, W_patches).
         """
-        x = frame.to(dtype=torch.float32)
+        # Strict dtype-based normalization:
+        # uint8 tensors in [0, 255] are scaled by 255.0; float tensors in [0, 1] are preserved
+        if frame.dtype == torch.uint8:
+            x = frame.float() / 255.0
+        else:
+            x = frame.float()
 
         # Standardize input dimensions
         if x.ndim == 3:
@@ -113,9 +124,6 @@ class DINOv2Slicer(nn.Module):
         if x.shape[1] != 3:
             raise ValueError(f"Expected 3 color channels (RGB), got {x.shape[1]}")
 
-        # Scale to [0, 1] if values are in [0, 255]
-        if x.max() > 1.0:
-            x = x / 255.0
 
         # Ensure spatial dimensions are multiples of PATCH_SIZE (14)
         _, _, h, w = x.shape
