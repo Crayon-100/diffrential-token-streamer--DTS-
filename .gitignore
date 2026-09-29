@@ -1,0 +1,59 @@
+# Virtual environments
+.venv/
+env/
+venv/
+ENV/
+
+# Python & test caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+wheels/
+
+# Local datasets & media
+data/DAVIS/
+data/**/*.jpg
+data/**/*.jpeg
+data/**/*.png
+data/**/*.zip
+data/**/*.tar*
+visualizations/
+*.png
+benchmark_vis.png
+
+# Internal agent / planning / audit scratchpads
+tasks/
+plan.md
+todo.md
+*.tmp
+evaluation*.txt
+audit*.txt
+future work.txt
+agent-skills/
+antigravity-skills/
+skills.md
+project specifications.md
+project_judge.md
+/BENCHMARK_REPORT.md
+/DOWNSTREAM_FIDELITY_REPORT.md
+/GATE2_BENCHMARK_REPORT.md
+!docs/GATE2_BENCHMARK_REPORT.md
+README.md
+*_demo.py
+save_benchmark_vis.py
+
+# Model weights: exclude all except frozen production codebook
+models/*
+!models/rvq_codebook_davis_train.pt
+
+# OS / Editor artifacts
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

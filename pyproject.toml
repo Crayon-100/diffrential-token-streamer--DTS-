@@ -1,0 +1,36 @@
+[project]
+name = "differential-token-streamer"
+version = "0.1.0"
+description = "Differential Token Streamer for split-inference vision transformers"
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "torch",
+    "torchvision",
+    "einops",
+    "pytest",
+    "vector-quantize-pytorch>=1.31.6",
+    "opencv-python>=5.0.0.93",
+    "pillow>=12.3.0",
+    "matplotlib>=3.10.9",
+    "imageio>=2.38.0",
+    "imageio-ffmpeg>=0.6.0",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }
+torchvision = { index = "pytorch-cu124" }
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
