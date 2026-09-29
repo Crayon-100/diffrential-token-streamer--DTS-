@@ -60,11 +60,12 @@ def compute_bitrate_kbps(total_wire_bytes: int, num_frames: int, fps: float = 25
 def encode_frames_to_h264(
     frames_rgb: List[np.ndarray],
     target_kbps: float,
-    output_path: str,
+    output_path: Optional[str] = None,
     fps: float = 25.0,
     gop: int = 250,
     lossless: bool = False,
     qp: Optional[int] = None,
+    output_mp4_path: Optional[str] = None,
 ) -> int:
     """Encodes a sequence of RGB frames [H, W, 3] to Annex-B H.264 using FFmpeg libx264.
 
@@ -76,10 +77,15 @@ def encode_frames_to_h264(
         gop: Group of Pictures keyframe interval (default: 250).
         lossless: If True, uses lossless encoding (-qp 0 -pix_fmt yuv444p).
         qp: Optional quantization parameter override (0 for lossless).
+        output_mp4_path: Backwards-compatible alias for output_path.
 
     Returns:
         Encoded file size in bytes.
     """
+    eff_output_path = output_path if output_path is not None else output_mp4_path
+    if eff_output_path is None:
+        raise ValueError("Must provide either output_path or output_mp4_path")
+
     if not frames_rgb:
         raise ValueError("frames_rgb list cannot be empty")
 
@@ -103,7 +109,7 @@ def encode_frames_to_h264(
             "-preset", "ultrafast",
             "-pix_fmt", "yuv444p",
             "-f", "h264",
-            output_path,
+            str(eff_output_path),
         ]
     else:
         # Calculate bitrates and buffer sizes (clamp target_kbps to minimum 10 kbps)
@@ -127,7 +133,7 @@ def encode_frames_to_h264(
             "-g", str(gop),
             "-pix_fmt", "yuv420p",
             "-f", "h264",
-            output_path,
+            str(eff_output_path),
         ]
 
     # Stream frames into FFmpeg stdin
@@ -146,9 +152,9 @@ def encode_frames_to_h264(
             f"FFmpeg encoding failed with code {process.returncode}:\n{stderr.decode('utf-8', errors='ignore')}"
         )
 
-    out_file = Path(output_path)
+    out_file = Path(eff_output_path)
     if not out_file.exists():
-        raise FileNotFoundError(f"Encoded H.264 file was not created: {output_path}")
+        raise FileNotFoundError(f"Encoded H.264 file was not created: {eff_output_path}")
 
     return out_file.stat().st_size
 
