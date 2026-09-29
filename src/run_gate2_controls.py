@@ -674,7 +674,7 @@ def generate_gate2_controls_report(
         "",
         "| Sequence | Frames | Raw Oracle | Gated Q=4 | Gated Q=2 | Gated Q=1 | Dense Q=1 | Dense Q=1 Skip | Fair H.264 | Floor A | Floor B | $\\Delta$ vs H.264 |",
         "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
-    ]
+    ])
 
     for e in evaluations:
         lines.append(
