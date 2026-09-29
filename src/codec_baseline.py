@@ -100,6 +100,8 @@ def encode_frames_to_h264(
         "-maxrate", f"{bitrate_int}k",
         "-bufsize", f"{bufsize_int}k",
         "-preset", "medium",
+        "-g", "25",
+        "-keyint_min", "25",
         "-pix_fmt", "yuv420p",
         output_mp4_path,
     ]
